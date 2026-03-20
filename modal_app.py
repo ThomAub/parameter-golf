@@ -189,12 +189,14 @@ def _extract_run_metrics(log_path: Path) -> dict:
     submission_size = _last(r"Total submission size int8\+zlib:\s+(?P<bytes>\d+)\s+bytes", "bytes")
     compressed_size = _last(r"Serialized model int8\+zlib:\s+(?P<bytes>\d+)\s+bytes", "bytes")
     params = _last(r"model_params:(?P<params>\d+)", "params")
+    submission_size_int = int(submission_size) if submission_size is not None else None
     return {
         "val_loss": float(val_loss) if val_loss is not None else None,
         "val_bpb": float(val_bpb) if val_bpb is not None else None,
-        "submission_size_bytes": int(submission_size) if submission_size is not None else None,
+        "submission_size_bytes": submission_size_int,
         "compressed_model_bytes": int(compressed_size) if compressed_size is not None else None,
         "model_params": int(params) if params is not None else None,
+        "constraint_ok": submission_size_int is not None and submission_size_int < 16_000_000,
     }
 
 
@@ -289,7 +291,14 @@ def sweep_jobs(variant: str = "sp1024", train_shards: int = 1, gpu_count: int = 
             results.append({"status": "ok", "run_id": run_id, "env": env, **call.get()})
         except Exception as exc:
             results.append({"status": "error", "run_id": run_id, "env": env, "error": str(exc)})
-    ranked = sorted([x for x in results if x.get("status") == "ok" and x.get("val_bpb") is not None], key=lambda x: (x["val_bpb"], x.get("submission_size_bytes") or 10**18))
+    ranked = sorted(
+        [
+            x
+            for x in results
+            if x.get("status") == "ok" and x.get("val_bpb") is not None and x.get("constraint_ok")
+        ],
+        key=lambda x: (x["val_bpb"], x.get("submission_size_bytes") or 10**18),
+    )
     summary = {"sweep_id": sweep_id, "variant": variant, "gpu_count": gpu_count, "results": results, "ranked_results": ranked, "job_count": len(results), "best": ranked[0] if ranked else None}
     (RUNS_ROOT / f"{sweep_id}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     data_volume.commit()

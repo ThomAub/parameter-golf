@@ -41,9 +41,10 @@ The benchmark runs a small Modal architecture sweep on `sp1024` with one trainin
 - `NUM_KV_HEADS`: `4`
 - `MLP_MULT`: `2`
 
-This gives 4 jobs per sweep and reports the best run's `val_bpb` plus size metrics from the generated sweep summary.
+This gives 4 jobs per sweep and reports the best **constraint-satisfying** run's `val_bpb` plus size metrics from the generated sweep summary.
 
 ## What's Been Tried
 - Baseline Modal app setup added: data preparation, train/sweep/summary/log commands, and ranking by `val_bpb`.
 - Initial benchmark target uses architecture sweeps first because they map directly to the active queue in `IDEAS.md` and are easy to compare across changes.
-- Still to explore: stronger sweep spaces, constraint filtering, richer parsing/reporting, schedule sweeps, and architecture ideas in `train_gpt.py` that improve the sweep frontier.
+- Adaptive short-run schedule defaults improved proxy `val_bpb`, but only by allowing the sweep winner to exceed the 16,000,000-byte cap. The benchmark now filters ranking to constraint-satisfying runs only.
+- Still to explore: stronger sweep spaces, richer parsing/reporting, schedule sweeps that preserve the cap, and architecture ideas in `train_gpt.py` that improve the constrained sweep frontier.
