@@ -467,6 +467,92 @@ The combination of seq_len=4096 + sliding window + cross-doc TTT + SWA should be
 
 ---
 
+## Analysis of PR #180: Current Merged Record (1.1428 BPB)
+
+PR #180 by thwu1 is the **current merged SOTA**, achieving **1.1428 BPB** (mean of 3 seeds). Unlike #457 which relies on TTT, this result is achieved entirely through training and compression innovations — no test-time training.
+
+### Results
+- val_bpb: **1.1428** (mean of seeds 42, 1337, 2024; std=0.00016)
+- 24.7M parameters, 15.35 MB artifact
+- 6,694 steps in 600s (89.5ms/step) on 8xH100
+
+### Key Techniques
+
+#### 1. Mixed Int5/Int6 Quantization (Core innovation)
+Routes different parameter types to different bit widths:
+- **MLP weights → int5** (clip_range=15, values in [-16, 15])
+- **Attention weights → int6** (clip_range=31, values in [-32, 31])
+- **Embeddings → fp16** (quantization-sensitive)
+- Per-row symmetric quantization with fp16 scales
+
+**Why int5 for MLPs?** Int5 values have 3 zero high bits per byte, which zstd-22
+compresses at **1.88x** (vs 1.51x for int6). The savings (~1.86 MB) funded a **10th
+transformer layer**.
+
+**Ablation**: int5 MLP alone hurts +0.008 BPB, but the extra layer it funds recovers
+that and more, netting -0.003 BPB overall.
+
+#### 2. BigramHash(10240) — Token-pair hashing embeddings
+Hashes consecutive token pairs `(token[t-1], token[t])` into a learned table:
+```python
+hash = XOR(36313 * curr_token, 27191 * prev_token) % 10239
+```
+- 10240 buckets × 128 dims, projected to 512 via CastedLinear
+- Learnable scale (init 0.05), zero-initialized embeddings/projection (starts as no-op)
+- Adds bigram context at the embedding level — cheaply captures token co-occurrence
+
+**vs vocab expansion**: Instead of enlarging the unigram vocab (which costs d_model
+params per token), BigramHash captures bigram patterns with a much smaller per-bucket
+cost (128 dims instead of 512). With 10240 buckets covering ~1M possible bigrams,
+collision rate is high but the model learns to use the noisy signal.
+
+#### 3. 3% Magnitude Pruning
+Post-training, before quantization: zeros out the bottom 3% of weights by magnitude
+in large 2D tensors. Creates more zeros → better compression under zstd-22.
+
+#### 4. Orthogonal Init with muP Scaling
+- All large (≥64×64) linear layers get orthogonal initialization
+- Output projections (attn.proj, mlp.proj) scaled by `1/sqrt(2*num_layers)`
+- Embeddings: normal init with std=0.005
+
+#### 5. Muon with Decoupled Weight Decay (WD=0.04)
+- Weight decay applied as `p *= (1 - lr * wd)` before the gradient step (decoupled)
+- Momentum warmup: 0.92 → 0.99 over 1500 steps
+- Three optimizers: Muon (matrices), AdamW (embeddings), AdamW (scalars), all WD=0.04
+
+#### 6. SWA — 24 checkpoints from last 40% of warmdown
+Collects checkpoints every 50 steps when LR multiplier < 0.4 (last 40% of warmdown).
+Running sum averaged at the end. ~24-29 checkpoints depending on step count.
+
+#### 7. Sliding Window Eval (stride=64, seq_len=2048)
+Same approach as PR #457 but with seq_len=2048 (not 4096). Only last `stride` tokens
+per window contribute to loss. First window scores all positions.
+
+### What We Should Adopt from PR #180
+
+| Technique | Priority | Effort | Notes |
+|---|---|---|---|
+| **Mixed int5/int6 quant** | **Critical** | Medium | ~1.86MB savings → more params |
+| **BigramHash** | High | Medium | Cheap bigram context, novel |
+| **Magnitude pruning** | High | Low | 5 lines of code, better compression |
+| **Orthogonal init + muP** | High | Low | Better training dynamics |
+| **Muon WD=0.04** | High | Low | Just a hyperparameter |
+| **SWA (every 50, last 40%)** | High | Low | Already planned |
+| **zstd-22 instead of zlib-9** | High | Low | Better compression ratio |
+
+### Key Insight: No TTT Needed for Strong Results
+PR #180 achieves **1.1428 BPB without any TTT**, which is better than PR #457's
+non-TTT result of 1.2192. The difference comes from:
+- Better quantization (int5/int6 mixed vs uniform int8) → more params
+- BigramHash vocabulary (captures bigram patterns cheaply)
+- Better hyperparameter tuning (WD, momentum warmup, orthogonal init)
+
+This suggests that **compression/architecture innovations have more headroom than
+TTT alone**. The optimal strategy combines both: strong training (int5/int6, BigramHash,
+larger model) PLUS correct causal TTT at eval time.
+
+---
+
 ## Correct TTT Implementation Guide
 
 Given the widespread invalidity of TTT submissions, here is a precise specification
