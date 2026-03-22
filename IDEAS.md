@@ -44,6 +44,13 @@
 - **Tensor Train / Low-Rank Factorization**: Decompose all weight matrices into tensor-train format with learned ranks. Can achieve 3-5x compression on MLP weights with minimal accuracy loss if ranks are tuned per layer.
 - **Activation Checkpointing + Wider Model**: Trade compute for memory to train a much wider model within GPU memory, then compress. Wider models compress better than deeper ones due to more redundancy in weight matrices.
 
+## Key Organizer Tips (integrated)
+- **16MB is compressed** — more params OK if they compress well. Baseline: ~22M params → <16MB via int8+zlib. Aggressive quant (int6/int5) allows 3x MLP expansion.
+- **Custom tokenizer allowed** — smaller vocab (default 1024) saves embedding params. See `data/cached_challenge_fineweb.py`.
+- **Sliding window eval** — significant BPB boost at eval time without changing the model. Eval seq len can differ from train seq len.
+- **Weight tying across layers** (depth recurrence) — not just embed/head tying. Already in IDEAS above.
+- **Muon optimizer** — especially effective for matrix params in constrained settings.
+
 ## Investigated & Rejected
 - **Encoder / MLM (BERT-style)**: Cannot compute exact BPB — pseudo-log-likelihood is an approximation, and exact marginalization costs O(n) forward passes per sequence (~1000x slower eval). Not viable for this competition format.
 - **Discrete Diffusion (MDLM, SEDD, D3PM)**: Provides valid ELBO-based likelihood but loses to autoregressive by 3-10% at small scale. Requires ~1000 denoising steps for tight bounds, making eval 1000x slower. Training convergence is also slower, wasting our 10-minute budget (see `research/encoder_diffusion_analysis.md`).
