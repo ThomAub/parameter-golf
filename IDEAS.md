@@ -21,9 +21,10 @@
 - **Sub-Quadratic Feedforward**: Replace relu^2 MLP with a sparse lookup or product-key memory. Same expressivity at lower parameter count — each token retrieves a small subset of a large implicit weight matrix.
 
 ## MoE-Specific
-- **Megablocks Framework**: Block-sparse GPU kernels for 2-5x faster MoE training vs naive PyTorch on single H100. Drop-in MLP replacement via `pip install megablocks` — the recommended framework for our setup (see `research/moe_analysis.md`).
+- **ScatterMoE / Megablocks Framework**: ScatterMoE (~700 lines of Triton) is best for single-GPU: no distributed overhead, 2-3x faster than naive PyTorch. Megablocks has faster raw kernels but heavier dependencies (see `research/moe_analysis.md`).
 - **Expert-Aware Quantization**: Calibrate each expert's int4 ranges only on tokens routed to it, not the full dataset. Paired with keeping routers in fp16, this is the MoE-specific quantization strategy from QMoE/MC-MoE that preserves routing fidelity.
-- **Zero-Cost MoE (Split Existing MLP)**: Split each 512→1024→512 MLP into 4 experts of 512→256→512 with top-2 routing — same total params, half the per-token MLP compute. Use the FLOP savings for more layers or larger d.
+- **Zero-Cost MoE (Split Existing MLP)**: Split each 512→1024→512 MLP into 8 experts of 512→128→512 with top-2 routing — same total params, half the per-token compute. Fine-grained experts give C(8,2)=28 routing combos vs C(4,2)=6, plus add 1 shared always-on expert (DeepSeek-style).
+- **Loss-Free Load Balancing (DeepSeek 2024)**: Dynamic per-expert bias on routing scores instead of auxiliary loss. Eliminates α-tuning and achieves better performance AND better balance than standard auxiliary loss methods.
 - **Shared Expert Codebooks**: If experts start from the same initialization, share int4 quantization centroids across all experts. Saves ~30% on scale metadata overhead at no quality cost.
 
 ## Training & Optimization
