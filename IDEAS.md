@@ -14,11 +14,17 @@
 
 ## Architecture
 - **Depth Recurrence (Universal Transformer)**: Reuse the same block weights across multiple layers, paying parameter cost once but getting depth for free. A 9-layer model with 3x weight sharing acts like 27 layers at 9-layer parameter cost.
-- **Mixture of Experts (MoE)**: Replace dense MLP with 4-8 small experts and a learned router, activating only 1-2 per token. Gets 2-4x effective MLP capacity with minimal parameter overhead from the router.
+- **Mixture of Experts (MoE)**: Replace dense MLP with 4-8 small experts and a learned router, activating only 1-2 per token. Zero-cost variant splits existing MLP into 4 experts (same params, half the compute); expanded variant with int4 targets ~35M total params for ~1.05-1.10 BPB (see `research/moe_analysis.md`).
 - **Paired-Head Attention on Steroids**: Go beyond GQA — pair query heads that share not just KV but also learned relative mixing coefficients. Cuts KV projection parameters further while maintaining representational diversity through learned head interactions.
 - **Manifold Ultra-Connections**: Replace linear skip connections with learned low-rank nonlinear transforms between encoder and decoder halves. Richer information flow across the U-Net skip topology at negligible parameter cost (~rank 16-32 bottleneck).
 - **Hyper-Efficient Attention (Linear / Performer)**: Replace softmax attention with a linear approximation for some layers. Frees up FLOP budget to run more training steps within the 10-minute wall clock.
 - **Sub-Quadratic Feedforward**: Replace relu^2 MLP with a sparse lookup or product-key memory. Same expressivity at lower parameter count — each token retrieves a small subset of a large implicit weight matrix.
+
+## MoE-Specific
+- **Megablocks Framework**: Block-sparse GPU kernels for 2-5x faster MoE training vs naive PyTorch on single H100. Drop-in MLP replacement via `pip install megablocks` — the recommended framework for our setup (see `research/moe_analysis.md`).
+- **Expert-Aware Quantization**: Calibrate each expert's int4 ranges only on tokens routed to it, not the full dataset. Paired with keeping routers in fp16, this is the MoE-specific quantization strategy from QMoE/MC-MoE that preserves routing fidelity.
+- **Zero-Cost MoE (Split Existing MLP)**: Split each 512→1024→512 MLP into 4 experts of 512→256→512 with top-2 routing — same total params, half the per-token MLP compute. Use the FLOP savings for more layers or larger d.
+- **Shared Expert Codebooks**: If experts start from the same initialization, share int4 quantization centroids across all experts. Saves ~30% on scale metadata overhead at no quality cost.
 
 ## Training & Optimization
 - **FP8 Training (H100)**: Use FP8 matmuls for forward/backward passes to nearly double throughput. More training steps in 10 minutes = lower loss at the same parameter count.
@@ -33,3 +39,8 @@
 - **Kolmogorov Complexity-Aware Training**: Add a regularizer that penalizes weight entropy directly, encouraging maximally compressible weight distributions. Trains the model to be good AND small simultaneously rather than training then compressing.
 - **Tensor Train / Low-Rank Factorization**: Decompose all weight matrices into tensor-train format with learned ranks. Can achieve 3-5x compression on MLP weights with minimal accuracy loss if ranks are tuned per layer.
 - **Activation Checkpointing + Wider Model**: Trade compute for memory to train a much wider model within GPU memory, then compress. Wider models compress better than deeper ones due to more redundancy in weight matrices.
+
+## Investigated & Rejected
+- **Encoder / MLM (BERT-style)**: Cannot compute exact BPB — pseudo-log-likelihood is an approximation, and exact marginalization costs O(n) forward passes per sequence (~1000x slower eval). Not viable for this competition format.
+- **Discrete Diffusion (MDLM, SEDD, D3PM)**: Provides valid ELBO-based likelihood but loses to autoregressive by 3-10% at small scale. Requires ~1000 denoising steps for tight bounds, making eval 1000x slower. Training convergence is also slower, wasting our 10-minute budget (see `research/encoder_diffusion_analysis.md`).
+- **Hybrid Diffusion (PLAID)**: Uses AR model for scoring anyway, so no BPB advantage over pure AR. Only helps generation quality, which isn't scored.
