@@ -367,6 +367,26 @@ Expected BPB        │ 1.224       │ ~1.10-1.13   │ ~1.08-1.12    │ ~1.03
 
 **Best for:** Pushing the frontier, willing to iterate on MoE tuning
 
+### MoE Reality Check (from scaling law research)
+
+**Honest assessment: MoE at 20-40M params is uncharted territory.**
+
+- Almost all MoE scaling laws are studied at 100M+ params. Smallest well-studied: DeepSeekMoE-2B.
+- At our scale, MoE advantage over dense is likely **1-3% loss improvement at best**.
+- Krajewski et al. (ICML 2024): MoE gap **widens** with scale — at 20M it's at its smallest.
+- Expert specialization requires enough diverse data. 10 min training may not differentiate experts.
+- The 16MB artifact budget is the binding constraint, not FLOPs — zero-cost MoE doesn't help artifact size.
+
+**The fundamental tension**: MoE gives more total params, but each extra param costs bits.
+At int4 for experts + int5/6 for attention, a 32M MoE model barely fits 16MB. Is the quality
+gain from expert specialization at int3-int4 > quality loss from harsher quantization?
+
+**More promising alternatives discovered:**
+- **Mixture of Depths (MoD)**: Zero extra params, tokens skip layers dynamically, 30-50% faster steps
+- **DS-MoE**: Train dense (max quality), convert to sparse at test time for faster TTT
+- **Mixture-of-Recursions (MoR)**: Depth recurrence + adaptive compute per token
+- **MoDE**: Combined MoD + MoE with no-op expert for token skipping
+
 ### Hybrid: Dense first, MoE second
 
 **Recommended approach:**
@@ -375,6 +395,20 @@ Expected BPB        │ 1.224       │ ~1.10-1.13   │ ~1.08-1.12    │ ~1.03
 3. **Week 3**: Expand MoE with int5 quant if zero-cost MoE shows gains
 
 This de-risks MoE by building on a strong dense baseline first.
+
+### Alternative: Dense + Mixture of Depths (MoD)
+
+Instead of MoE, consider MoD which adds **zero parameters** but lets tokens skip layers:
+- Router per layer: 512→1 linear (512 params, negligible)
+- Top-50% of tokens pass through the layer; rest skip via residual
+- Result: ~50% fewer FLOPs → nearly 2x faster training steps → more iterations in 10 min
+- Can be combined with MoE later (MoDE architecture)
+
+This may be more practical than MoE at our scale because:
+- No extra parameters (the 16MB budget is the bottleneck, not compute)
+- No expert collapse / load balancing issues
+- Training speedup directly translates to more steps = lower loss
+- Compatible with all other techniques (XSA, VRL, BigramHash, TTT)
 
 ---
 

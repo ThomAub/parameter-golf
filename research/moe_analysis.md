@@ -277,3 +277,87 @@ Too many params — dial back to 4 experts or smaller expert_dim. Targeting ~35M
 | Baseline dense | 17M | 17M | ~15.8MB | 1.2244 |
 | Phase 1 MoE | 17M | ~13M | ~15.8MB | ~1.18 (more layers from FLOP savings) |
 | Phase 2 MoE + int4 | 35M | ~20M | ~15MB | ~1.05-1.10 |
+
+---
+
+## Updated Assessment (Post-Research)
+
+### MoE at Our Scale: Honest Reality Check
+
+**The MoE advantage at 20-40M params is largely uncharted and likely marginal.**
+
+Key findings from scaling law research (Krajewski et al. ICML 2024, Ludziejewski et al. 2025):
+- MoE advantage **widens** with scale — at our 20M scale it's at its smallest
+- The "Efficiency Leverage" metric shows minimal advantage at low compute budgets
+- At 512 dim, experts become very small (128-256 hidden) — may not learn meaningful specialization
+- 10 min training may not be enough for expert differentiation
+
+### The 16MB Math Problem
+
+```
+MoE model: 32M params, shared+4 routed experts per layer
+  At INT5: 32M × 5 bits = 20.0 MB → EXCEEDS 16MB
+  At INT4: 32M × 4 bits = 16.0 MB → barely fits, but INT4 quality loss is real
+  At INT3 (experts) + INT5 (attn): ~14.5 MB → fits, but INT3 expert quality unknown
+
+Dense model: 30M params with better quant
+  At mixed INT4/INT5/INT6: ~15.5 MB → fits comfortably, proven quality
+```
+
+The dense model at 30M with careful mixed quantization may beat a 32M MoE model
+where experts are forced to INT3-INT4. Expert weights are less quantization-sensitive
+(per QMoE/MoEQuant research), but at our tiny scale this isn't validated.
+
+### More Promising Alternatives to MoE
+
+#### Mixture of Depths (MoD) — Zero extra params, faster training
+- Per-layer router (512→1, ~512 params) decides which tokens skip the layer
+- Top-50% tokens processed, rest use residual connection
+- **30-50% faster training** → more steps in 10 min → lower loss
+- Zero artifact size increase — the 16MB bottleneck is not affected
+- DeepMind (2024): matches baseline quality at 50% FLOPs
+
+#### Mixture-of-Recursions (MoR) — Depth recurrence + adaptive compute
+- Shared weights across layers (as in Universal Transformer)
+- Per-token adaptive depth: easy tokens use fewer iterations, hard tokens use more
+- Combines parameter efficiency (shared weights) with conditional compute
+- Explicitly mentioned in the Parameter Golf README as interesting
+
+#### DS-MoE — Train dense, convert to sparse at test time
+- Train a wider dense model using full compute budget
+- At eval time, convert to sparse MoE for faster TTT iterations
+- Best of both worlds: dense quality during training, sparse speed during TTT
+
+#### MoDE — Combined MoD + MoE
+- Some tokens skip layers entirely (MoD), others route through MoE experts
+- "Integrated MoDE" adds a no-op expert alongside real experts
+- Outperforms standard MoE in recent benchmarks
+
+### Revised Recommendation
+
+**For Parameter Golf, pure MoE is likely not the optimal path.** The 16MB constraint
+favors maximizing unique parameter quality, not total parameter count.
+
+Instead, consider this priority order:
+1. **Dense + aggressive compression** (int4 MLP QAT, int5/6 attn) → 30M params in 16MB
+2. **Mixture of Depths** on top of dense → faster training, no size increase
+3. **Depth recurrence** (shared layers + LoRA) → test-time depth scaling
+4. **MoE only if** the above are exhausted and you need more capacity
+
+The strongest current submissions (PR#180 at 1.1428, PR#457 at 1.1839 w/ TTT) are
+ALL dense models. MoE has not been proven at this scale in this competition.
+
+### Key MoE Papers Referenced
+- [Krajewski et al. — Fine-grained MoE scaling laws (ICML 2024)](https://arxiv.org/abs/2402.07871)
+- [Ludziejewski et al. — Joint MoE scaling laws (2025)](https://arxiv.org/pdf/2502.05172)
+- [DeepSeekMoE — Shared + routed experts](https://arxiv.org/abs/2401.06066)
+- [SonicMoE — Efficient MoE on Hopper (2025)](https://arxiv.org/html/2512.14080v1)
+- [Mixture of Depths (DeepMind, 2024)](https://arxiv.org/abs/2404.02258)
+- [Mixture-of-Recursions (2025)](https://arxiv.org/html/2507.10524v1)
+- [DS-MoE — Dense to sparse (2024)](https://arxiv.org/abs/2404.05567)
+- [MoDE — Combined MoD + MoE (2025)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5403647)
+- [PEER — Million experts (DeepMind, 2024)](https://arxiv.org/abs/2407.04153)
+- [MoE++ — Zero-computation experts (ICLR 2025)](https://proceedings.iclr.cc/paper_files/paper/2025)
+- [Rewiring Experts on the Fly (2025)](https://arxiv.org/html/2510.14853v1)
+- [QMoE — Sub-1-bit MoE compression (MLSys 2024)](https://proceedings.mlsys.org/paper_files/paper/2024)
+- [MoEQuant — Calibration challenges (ICML 2025)](https://arxiv.org/html/2505.03804v1)
