@@ -378,10 +378,118 @@ This de-risks MoE by building on a strong dense baseline first.
 
 ---
 
+## Our Bet: Dense+ First, Then MoE Graduation
+
+### Phase 1: Enhanced Dense (~30M params) — Target: 1.10–1.13 BPB
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     ENHANCED DENSE MODEL                        │
+│                                                                  │
+│  tok_emb(1024, 512) ──► SmearGate ──► BigramHash(10240)         │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌─────────────────────────────────────────────────────┐         │
+│  │  11 Transformer Blocks × 512d                       │         │
+│  │  ┌─────────────────────────────────────────────┐    │         │
+│  │  │ GQA(8Q, 4KV) + VRL(λ·v_first)              │    │         │
+│  │  │ XSA on last 4 layers                        │    │         │
+│  │  │ relu² MLP: 512→1024→512                     │    │         │
+│  │  │ U-Net skips, resid_mix(x, x0)              │    │         │
+│  │  └─────────────────────────────────────────────┘    │         │
+│  └─────────────────────────────────────────────────────┘         │
+│       │                                                          │
+│       ▼                                                          │
+│  lm_head (tied) + softcap(30)                                    │
+│                                                                  │
+│  QUANTIZATION:                                                   │
+│  ├── Embedding:  fp16                                            │
+│  ├── Attention:  int5 (middle layers) / int6 (first+last)       │
+│  ├── MLP:        int4 with QAT (warmdown-QAT)                   │
+│  ├── BigramHash: fp16                                            │
+│  ├── Pruning:    5-8% unstructured + fine-tune recovery          │
+│  └── Compress:   LZMA -9e (or custom ANS)                       │
+│                                                                  │
+│  TRAINING:                                                       │
+│  ├── seq_len=4096, batch=786K tokens                             │
+│  ├── Muon WD=0.04, orthogonal init + muP                        │
+│  ├── SWA: 24 ckpts from last 40% warmdown                       │
+│  └── Warmdown-QAT: enable int4 STE in last 1200 steps           │
+│                                                                  │
+│  EVAL (test-time compute):                                       │
+│  ├── Sliding window: stride=64, seq_len=4096                    │
+│  └── Causal TTT: rank-8 LoRA on Q,V,lm_head (score-then-adapt) │
+│                                                                  │
+│  BUDGET: ~30M params @ ~4.3 eff. bits/param → ~15.5MB           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 2: MoE Upgrade (~38M params) — Target: 1.03–1.08 BPB
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       MOE MODEL                                  │
+│                                                                  │
+│  Same embedding pipeline (tok_emb + SmearGate + BigramHash)      │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌─────────────────────────────────────────────────────┐         │
+│  │  12 Transformer Blocks × 576d                       │         │
+│  │  ┌─────────────────────────────────────────────┐    │         │
+│  │  │ Dense Attention: GQA(8Q, 4KV) + VRL + XSA   │    │         │
+│  │  │                                             │    │         │
+│  │  │ MoE MLP:                                    │    │         │
+│  │  │   1 shared expert (576→288→576, always on)  │    │         │
+│  │  │ + 8 routed experts (576→144→576, top-2)     │    │         │
+│  │  │   Router: 576→8, loss-free balancing         │    │         │
+│  │  │   Active: shared + 2 routed = ~660K params  │    │         │
+│  │  └─────────────────────────────────────────────┘    │         │
+│  └─────────────────────────────────────────────────────┘         │
+│       │                                                          │
+│       ▼                                                          │
+│  lm_head (tied) + softcap(30)                                    │
+│                                                                  │
+│  QUANTIZATION:                                                   │
+│  ├── Experts (routed): int4 with QAT                             │
+│  ├── Shared expert:    int5                                      │
+│  ├── Attention:        int5/int6 (sensitivity-based)             │
+│  ├── Router:           fp16 (NEVER quantize!)                    │
+│  ├── Pruning:          5% unstructured                           │
+│  └── Compress:         LZMA or custom ANS                        │
+│                                                                  │
+│  BUDGET: ~38M params @ ~3.5 eff. bits/param → ~15.8MB           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 3 (Speculative): Depth Recurrence + MoE — Target: <1.00 BPB?
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                 DEPTH-RECURRENT MOE                              │
+│                                                                  │
+│  3 unique transformer blocks (shared weights)                    │
+│  × 4 loops during training (12 effective layers)                 │
+│  × 8 loops during eval (24 effective layers!)                    │
+│                                                                  │
+│  Each block: dense attn + MoE MLP (8 experts + 1 shared)        │
+│  Per-loop LoRA adapters (tiny, ~10K params each)                 │
+│                                                                  │
+│  Unique params: 3 blocks × ~2M = 6M + LoRA adapters             │
+│  → Massive freed budget for width: d=768 or d=1024              │
+│  → 40M+ effective params at eval in <16MB                        │
+│                                                                  │
+│  Risk: very hard to train, untested at this scale                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Key Decisions Needed
 
-1. **Dense or MoE?** → Start dense, graduate to MoE
-2. **Vocab size?** → 1024 (current) or 2048? BigramHash may substitute for larger vocab
-3. **seq_len?** → 4096 (proven by PR#457) vs 2048 (proven by PR#180)
-4. **int5/int6 or int4?** → int5/int6 is proven; int4 enables MoE but needs QAT
-5. **TTT scope?** → Per-document causal TTT with rank-8 LoRA (validated, but must be causal!)
+1. **Dense or MoE?** → Start dense (Phase 1), graduate to MoE (Phase 2)
+2. **Vocab size?** → 1024 (current). BigramHash(10240) substitutes for larger unigram vocab
+3. **seq_len?** → 4096 (proven by PR#457, "single largest contributor")
+4. **Quantization?** → int4(MLP)/int5-6(attn) with warmdown-QAT. Target ~4.0-4.5 eff. bits/param
+5. **Compression?** → Try LZMA first, then custom ANS if worth the effort
+6. **TTT?** → Per-document causal TTT with rank-8 LoRA (score-then-adapt, NEVER adapt-then-score)
+7. **Pruning?** → 5-8% unstructured magnitude, with fine-tune recovery
