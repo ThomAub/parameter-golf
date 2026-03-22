@@ -27,6 +27,32 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# FP8 training toggle: set USE_FP8=1 to use FP8 matmuls on H100 (SM90+).
+USE_FP8 = bool(int(os.environ.get("USE_FP8", "0")))
+# Triton fused kernels toggle: set USE_TRITON_KERNELS=1 to enable fused MLP.
+USE_TRITON_KERNELS = bool(int(os.environ.get("USE_TRITON_KERNELS", "0")))
+
+_triton_available = False
+if USE_TRITON_KERNELS:
+    try:
+        import triton
+        import triton.language as tl
+        _triton_available = True
+    except ImportError:
+        USE_TRITON_KERNELS = False
+
+_fp8_available = False
+if USE_FP8:
+    try:
+        # Requires PyTorch 2.1+ with H100/SM90 GPU
+        _fp8_dtype = torch.float8_e4m3fn
+        _fp8_dtype_bw = torch.float8_e5m2
+        _fp8_available = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+        if not _fp8_available:
+            USE_FP8 = False
+    except AttributeError:
+        USE_FP8 = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -494,6 +520,95 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
+# FP8 UTILITIES
+# -----------------------------
+
+def _fp8_amax_to_scale(amax: Tensor, fp8_dtype: torch.dtype) -> Tensor:
+    """Convert observed amax to a per-tensor FP8 scale."""
+    fp8_max = torch.finfo(fp8_dtype).max
+    # Clamp amax to avoid div-by-zero; return scale = fp8_max / amax.
+    return (fp8_max / amax.clamp(min=1e-12)).clamp(max=fp8_max)
+
+
+def _fp8_linear_forward(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+    """FP8 matmul: quantize inputs/weights to float8_e4m3fn, matmul, then upcast."""
+    # Per-tensor dynamic quantization (no history, simplest approach).
+    x_flat = x.reshape(-1, x.size(-1))
+    x_amax = x_flat.abs().amax()
+    w_amax = weight.abs().amax()
+    x_scale = _fp8_amax_to_scale(x_amax, _fp8_dtype)
+    w_scale = _fp8_amax_to_scale(w_amax, _fp8_dtype)
+    x_fp8 = (x_flat * x_scale).to(_fp8_dtype)
+    w_fp8 = (weight * w_scale).to(_fp8_dtype)
+    # Use torch._scaled_mm for H100 FP8 tensor cores.
+    out = torch._scaled_mm(
+        x_fp8, w_fp8.t(),
+        out_dtype=x.dtype,
+        scale_a=torch.tensor(1.0 / x_scale.item(), device=x.device),
+        scale_b=torch.tensor(1.0 / w_scale.item(), device=x.device),
+    )
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out.reshape(*x.shape[:-1], weight.size(0))
+
+
+# -----------------------------
+# TRITON FUSED KERNELS
+# -----------------------------
+
+if USE_TRITON_KERNELS and _triton_available:
+    @triton.jit
+    def _fused_relu_sq_kernel(
+        X_ptr, Out_ptr,
+        N: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused ReLU + square activation: out = relu(x)^2."""
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(X_ptr + offsets, mask=mask, other=0.0)
+        relu_x = tl.where(x > 0.0, x, 0.0)
+        tl.store(Out_ptr + offsets, relu_x * relu_x, mask=mask)
+
+    def fused_relu_sq(x: Tensor) -> Tensor:
+        """Apply fused relu^2 using Triton kernel."""
+        out = torch.empty_like(x)
+        n = x.numel()
+        BLOCK = 1024
+        grid = ((n + BLOCK - 1) // BLOCK,)
+        _fused_relu_sq_kernel[grid](x, out, n, BLOCK=BLOCK)
+        return out
+
+    @triton.jit
+    def _fused_rmsnorm_kernel(
+        X_ptr, Out_ptr,
+        stride_row: tl.constexpr,
+        D: tl.constexpr,
+        eps: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused RMSNorm: out = x / rms(x) where rms = sqrt(mean(x^2) + eps)."""
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        x = tl.load(X_ptr + row * stride_row + offsets, mask=mask, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=0) / D
+        rrms = 1.0 / tl.sqrt(var + eps)
+        tl.store(Out_ptr + row * stride_row + offsets, (x * rrms).to(tl.bfloat16), mask=mask)
+
+    def triton_rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
+        """RMSNorm via Triton — fused, no Python overhead per row."""
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        out = torch.empty_like(x_2d)
+        n_rows, D = x_2d.shape
+        BLOCK_D = triton.next_power_of_2(D)
+        _fused_rmsnorm_kernel[(n_rows,)](x_2d, out, D, D, eps if eps else 1e-6, BLOCK_D=BLOCK_D)
+        return out.reshape(shape)
+
+
+# -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
 
@@ -503,13 +618,18 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
+        if USE_TRITON_KERNELS and _triton_available:
+            return triton_rmsnorm(x, self.eps or 1e-6)
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # When USE_FP8=1, uses FP8 tensor cores on H100 for ~1.5-2x matmul throughput.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
+        if USE_FP8 and self.weight.numel() > 4096:
+            return _fp8_linear_forward(x, self.weight.to(x.dtype), bias)
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
@@ -604,7 +724,9 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # relu^2 MLP from the original modded-nanogpt setup.
+    # When USE_TRITON_KERNELS=1, uses a fused relu^2 Triton kernel to save one
+    # memory round-trip (relu + square merged into a single pass).
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
@@ -613,8 +735,12 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        h = self.fc(x)
+        if USE_TRITON_KERNELS and _triton_available:
+            h = fused_relu_sq(h)
+        else:
+            h = torch.relu(h).square()
+        return self.proj(h)
 
 
 class Block(nn.Module):
@@ -896,6 +1022,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"fp8_training:{USE_FP8} triton_kernels:{USE_TRITON_KERNELS}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

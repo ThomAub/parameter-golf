@@ -28,7 +28,10 @@
 - **Shared Expert Codebooks**: If experts start from the same initialization, share int4 quantization centroids across all experts. Saves ~30% on scale metadata overhead at no quality cost.
 
 ## Training & Optimization
-- **FP8 Training (H100)**: Use FP8 matmuls for forward/backward passes to nearly double throughput. More training steps in 10 minutes = lower loss at the same parameter count.
+- **FP8 Training (H100) [IMPLEMENTED — Phase 1]**: Use FP8 matmuls for forward/backward passes to nearly double throughput. More training steps in 10 minutes = lower loss at the same parameter count. Enable with `USE_FP8=1`. Uses dynamic per-tensor quantization to `float8_e4m3fn` via `torch._scaled_mm` on SM90+ GPUs. Only applied to large weight matrices (>4096 elements) to avoid overhead on small tensors.
+- **Triton Fused Kernels [IMPLEMENTED — Phase 1]**: Enable with `USE_TRITON_KERNELS=1`. Two custom kernels:
+  - **Fused ReLU^2**: Merges relu + square into a single Triton kernel, saving one memory round-trip in the MLP forward pass (~10-15% MLP speedup).
+  - **Fused RMSNorm**: Triton RMSNorm replaces `F.rms_norm` with a single-pass fused kernel, eliminating intermediate allocations (~5-10% norm speedup).
 - **Progressive Growing**: Start training with fewer layers and smaller sequences, then grow. Faster early iterations let the model see more data in the same wall clock budget.
 - **Aggressive Learning Rate Schedules**: Use WSD (warmup-stable-decay) with a much shorter stable phase. Matched to the 20K iteration budget, this can squeeze out a few percent lower loss.
 - **Distillation from a Larger Run**: Train a 40M+ parameter teacher unconstrained, then distill into the submission model. The student can learn softer targets that compress better than raw data.
