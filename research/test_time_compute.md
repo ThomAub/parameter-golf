@@ -382,9 +382,39 @@ Collects 24 evenly-spaced checkpoints during the final 40% of warmdown, then ave
 **Cost**: Memory during training to store 24 state dicts. No extra eval compute.
 
 #### 6. Cross-Document Test-Time Training (TTT) — The killer feature (+0.035 BPB!)
+
+**CRITICAL CAVEAT: TTT Data Leakage Controversy**
+
+There is an active debate (see GitHub issue comments on multiple PRs) about whether
+many TTT implementations are **invalid** because they train on eval tokens before
+scoring them. The correct ("causal") TTT protocol is:
+
+```
+CORRECT (online/causal TTT):
+for each chunk t = 1..T:
+    1. SCORE chunk t with current weights    ← predict BEFORE adaptation
+    2. ADAPT weights using chunks 1..t       ← learn AFTER scoring
+
+INCORRECT (non-causal TTT — equivalent to training on eval data):
+for each chunk t = 1..T:
+    1. ADAPT weights using chunks 1..t       ← learn BEFORE scoring
+for each chunk t = 1..T:
+    2. SCORE chunk t with adapted weights    ← model already saw answers!
+```
+
+The incorrect version is equivalent to appending eval tokens to training data and
+is considered cheating. Multiple PRs (#136, #152, #254, #264, #338, #398, #417,
+#421, #442) have been flagged as potentially invalid for this reason.
+
+**Our TTT implementation MUST use the correct causal protocol.** This means the
+first chunk gets zero TTT benefit (scored with unadapted weights), and the gain
+accumulates only for later chunks.
+
+---
+
 This is the **most impactful TTC technique** in the PR, providing a **0.035 BPB** improvement on top of an already-strong model.
 
-**How it works:**
+**How it works (claimed correct protocol):**
 1. Rank-8 LoRA adapters are added to Q, V projections and the LM head
 2. For each document in the validation set:
    - Process the document in chunks using a sliding window (stride=64)
@@ -396,7 +426,7 @@ This is the **most impactful TTC technique** in the PR, providing a **0.035 BPB*
 **Why it works:**
 - Each document has its own distributional characteristics (topic, style, vocabulary)
 - LoRA with rank 8 has very few parameters (~50K) so it can adapt quickly
-- By training on already-scored tokens, there's no data leakage
+- By training on already-scored tokens, there's no data leakage (IF correctly implemented)
 - The base model provides strong priors; LoRA just does fine-grained domain adaptation
 
 **Implementation details from the PR:**
@@ -434,3 +464,64 @@ Given PR #457's results, our priority order should be:
 6. **Depth recurrence** — still valuable for parameter efficiency, but TTT may be more impactful per-unit-effort
 
 The combination of seq_len=4096 + sliding window + cross-doc TTT + SWA should be our primary focus. Depth recurrence becomes a secondary optimization for freeing parameter budget.
+
+---
+
+## Correct TTT Implementation Guide
+
+Given the widespread invalidity of TTT submissions, here is a precise specification
+for correct causal TTT.
+
+### Protocol: Score-Then-Adapt (Causal TTT)
+
+```python
+def eval_with_ttt(model, lora, val_tokens, window_size, stride):
+    """Correct causal TTT: score BEFORE adapt, never the reverse."""
+    total_loss = 0.0
+    total_scored = 0
+    pos = 0
+
+    while pos + window_size <= len(val_tokens):
+        x = val_tokens[pos : pos + window_size]
+        y = val_tokens[pos + 1 : pos + window_size + 1]
+
+        # STEP 1: SCORE with current weights (before any adaptation on this chunk)
+        with torch.no_grad():
+            logits = model_with_lora(x)
+            # Only score the last `stride` positions (sliding window)
+            score_start = window_size - stride
+            loss = F.cross_entropy(logits[score_start:], y[score_start:], reduction='sum')
+            total_loss += loss.item()
+            total_scored += stride
+
+        # STEP 2: ADAPT on the tokens we just scored (and all prior tokens)
+        # This adaptation benefits FUTURE chunks, not the current one
+        lora.zero_grad()
+        train_logits = model_with_lora(x)
+        train_loss = F.cross_entropy(train_logits, y, reduction='mean')
+        train_loss.backward()
+        lora_optimizer.step()
+
+        pos += stride
+
+    return total_loss / total_scored
+```
+
+### Key invariant
+At the moment a token is scored, the model weights must NOT have been updated
+using that token (or any future token) as a training signal. The model may only
+have been adapted on tokens strictly before the scored position.
+
+### Per-document vs cross-document
+- **Per-document**: Reset LoRA weights at each document boundary. Adaptation is
+  local to each document. Safer and simpler.
+- **Cross-document**: Keep LoRA weights across documents. Riskier but captures
+  corpus-level patterns. Must still maintain causal scoring order.
+
+### Expected gain with correct TTT
+Correct causal TTT provides less benefit than non-causal (cheating) TTT because:
+- The first chunk of each document gets zero adaptation benefit
+- Short documents benefit less (fewer chunks to accumulate adaptation)
+- Estimated gain: **0.015–0.025 BPB** (vs ~0.035 for non-causal)
+
+Still substantial and the single biggest legitimate TTC technique available.
