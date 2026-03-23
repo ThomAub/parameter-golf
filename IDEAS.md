@@ -1,11 +1,73 @@
 # Parameter Golf: Ideas
 
 ## Quantization & Compression
-- **INT4 Quantization**: Double the effective parameter budget from ~19M to ~38M by moving from int8 to int4 weight quantization. The single highest-leverage change available — requires careful per-channel scaling to limit accuracy loss.
-- **Mixed-Precision Quantization (INT4/INT8)**: Keep embedding and attention projections in int8 while quantizing MLP weights to int4. Balances compression ratio with sensitivity of different layer types.
-- **GPTQ / AWQ-style Quantization**: Use calibration data to find optimal rounding decisions during quantization. Can recover 0.5-1% of the naive quantization loss at no size cost.
-- **Learned Quantization Scales**: Train quantization step sizes jointly with model weights (QAT). Eliminates the post-training quantization gap entirely at the cost of slower training.
-- **Pruning + Quantization Pipeline**: Structured pruning to remove entire attention heads or MLP neurons before quantizing. Compound compression — prune 20% then int4 quantize for ~2.5x effective parameter increase.
+
+### Tier 1 — Implement first (highest ROI)
+- **INT4 Group Quantization (g=128, asymmetric)**: Double effective param budget from ~19M→~38M. Per-group (128 weights/group) with asymmetric scales (learned zero-point) is the sweet spot. Recovers 2-4% over symmetric at int4. Per-input-channel grouping isolates activation outliers for another 1-3%. ~100-150 lines to implement.
+- **STE-Based QAT (2-3 epochs fine-tuning)**: Insert fake quantization nodes in forward pass, use straight-through estimator for gradients. Master weights in BF16, quantized for compute only. Recovers 5-15% of int4 PTQ accuracy gap at zero size cost. Key practices: LR 10-100x lower than base, quantize only Linear layers (keep LayerNorm/embeddings float). ~150-200 lines. References: PyTorch `torch.ao.quantization`, bitsandbytes.
+- **Mixed-Precision INT4/INT8**: MLP weights → INT4 (bulk of params, tolerant). Attention QKV/O → INT4 or INT8 (sensitivity-dependent). Embeddings → INT8 (high sensitivity). Control tensors (scales, gains) → FP16.
+
+### Tier 2 — If time permits
+- **GPTQ (Hessian-aware rounding)**: Sequential layer-by-layer quantization using second-order (Hessian) info from 128-1000 calibration samples. Recovers ~0.5-1% over naive RTN at same bit depth. Post-training only, no training loop changes. ~300-400 lines. Ref: [IST-DASLab/gptq](https://github.com/IST-DASLab/gptq), [ModelCloud/GPTQModel](https://github.com/ModelCloud/GPTQModel).
+- **Quantization-Aware Distillation (QAD)**: Train quantized student to match full-precision teacher's soft outputs (KL divergence). Loss = αL_task + (1-α)L_distill. Recovers 90-98% of accuracy gap (NVIDIA NVFP4 report). ~1.5-2x training wall clock. ~300-500 lines.
+- **LSQ / LSQ+ (Learned Step Sizes)**: Jointly learn quantization scales via gradient descent. Closes PTQ-QAT gap by ~60-70% at 4 bits. Most useful for extreme int2-int3 (MoE expert weights). ~200-400 lines.
+
+### Tier 3 — Speculative / marginal
+- **AQLM (Additive Quantization)**: Learnable codebooks, sub-4-bit Pareto-optimal. High complexity (800-1500 lines), slow. Our int4+zlib budget already gives similar compression. Skip unless targeting <2 bits.
+- **BitNet 1-bit**: Native ternary {-1,0,+1} training from scratch. Competitive at 2B+ params but not applicable at 50M scale. Int4 budget is generous by comparison.
+- **NF4 (NormalFloat4)**: Information-theoretically optimal for normally-distributed weights. Used in QLoRA. Marginal gain over standard int4 for our setting.
+
+### Concrete size budget math
+```
+50M params × int4 (0.5 bytes/param) = ~25MB raw
+  + scales: 50M/128 × 2 bytes (fp16) = ~0.78MB
+  → ~25.8MB pre-compression
+  + zlib level 9 → ~5-7MB (entropy-coded, ~3-4x ratio on int4)
+  + code ~200KB
+  = ~5.5-7.5MB total artifact (well under 16MB)
+  → Headroom for 80-100M params if needed
+```
+
+## Pruning & Sparsity
+
+### Best bets for 16MB / 10-min constraint
+- **Wanda (post-training, ~2 min)**: Activation-weighted magnitude pruning. Single forward pass calibration, no retraining. 70% sparsity achievable. Outperforms magnitude pruning significantly (LLaMA-7B: 7.26 vs 17.29 perplexity). Sparse weights compress 2-3x better with zlib. Simplest to implement. Ref: [locuslab/wanda](https://github.com/locuslab/wanda).
+- **N:M 2:4 Sparsity (H100 native)**: 50% structured sparsity with native Tensor Core acceleration (1.3-1.8x end-to-end speedup). Well-studied: ~1-2% perplexity increase. Order critical: **sparsify first, then quantize**. Pairs excellently with int4. Ref: NVIDIA TensorRT sparse docs.
+- **Gradual Magnitude Pruning (GMP, in-training)**: For 20K steps: stabilize ~500 steps → prune ~10K steps → fine-tune ~9.5K steps. Cosine annealing pruning rate. Achievable: 50-60% sparsity, minimal degradation. Avoid pruning early layers aggressively. ~Low complexity, integrated into training loop.
+- **Block Sparsity (4x4 / 8x8)**: Contiguous zero blocks compress 50-80% better under zlib than random unstructured sparsity. 70% block-sparse → ~2.5-3x compression (vs ~2x unstructured). Slightly higher quality cost than unstructured.
+
+### Viable but lower priority
+- **SparseGPT (one-shot, Hessian-based)**: 60% unstructured sparsity with <5% perplexity increase. Generalizes to 2:4 and 4:8 patterns. Higher quality than Wanda but slower. Ref: [IST-DASLab/sparsegpt](https://github.com/IST-DASLab/sparsegpt).
+- **Structured Dropout (LayerDrop)**: Randomly skip layers/heads during training → network learns importance ordering → prune unimportant permanently at export. 30-40% pruning with <2% quality loss. Elegant but limited scope.
+- **Structured Pruning (heads/neurons)**: Remove entire attention heads or MLP neurons via magnitude/Taylor/Fisher. 30% pruning ratio with minimal quality loss. Use Torch-Pruning (DepGraph) for dependency handling.
+
+### Rejected for our setting
+- **Lottery Ticket (IMP)**: Needs multiple train-prune-reset cycles. Not practical in 10-min budget.
+- **RigL / Dynamic Sparsity**: 15-25% training overhead, marginal gains over static pruning in short runs.
+- **Movement Pruning**: Better for fine-tuning, not from-scratch training.
+
+### Recommended pipeline: Sparse + Quantize
+```
+Order: PRUNE FIRST → then QUANTIZE (critical — reverse order degrades quality)
+
+Option A (post-training, fast):
+  1. Wanda 70% sparsity (2 min, single forward pass)
+  2. GPTQ int4 quantization (1 min)
+  3. Optional: GMP fine-tune 7 min for recovery
+  → 8-12x compression, <15% perplexity loss
+
+Option B (hardware-accelerated):
+  1. SparseGPT/Wanda to 50% 2:4 sparsity (3 min)
+  2. GPTQ int4 quantization (2 min)
+  3. GMP fine-tune with 2:4 mask frozen (5 min)
+  → H100 Tensor Core acceleration + 16MB size
+
+Option C (training-integrated, best quality):
+  1. GMP during training: 50-60% sparsity (built into 20K step schedule)
+  2. STE-based int4 QAT last 2-3 epochs
+  3. Block-sparse pattern for zlib-friendly compression
+  → Best quality, but more complex implementation
+```
 
 ## Vocabulary & Tokenization
 - **Optimal Vocab Size (2048-4096)**: Increase vocab from 1024 to reduce tokens-per-byte by 15-30%, directly lowering BPB. Sweet spot balances embedding table cost against sequence compression (see `research/optimal_vocab_size.md`).
