@@ -240,3 +240,151 @@ Before committing to full implementation, test the core hypothesis:
 - [Residual EBMs for Text (ICLR)](https://openreview.net/pdf?id=B1l4SgHKDH) — Joint LM + energy model, lower perplexity with fewer params
 - [Energy-Based Diffusion LMs (2024)](https://arxiv.org/html/2410.21357v1) — EDLM with BPC evaluation
 - [Continuous AR LMs / BrierLM](https://arxiv.org/pdf/2510.27688) — Likelihood-free evaluation for continuous models
+
+---
+
+## Implementation Plan
+
+### Key Discovery: `byte260` data variant already exists
+The challenge data pipeline (`data/cached_challenge_fineweb.py`) already supports a `byte260` variant:
+- 256 raw byte values + 4 control tokens (pad=0, bos=1, eos=2, unk=3), byte_offset=4
+- Same shard format as tokenized data (uint16 `.bin` files with 256-int header)
+- Download: `python data/cached_challenge_fineweb.py --variant byte260`
+
+This means **no data pipeline work needed** — just point at the byte260 shards.
+
+### Step 0: Download byte260 data
+```bash
+python data/cached_challenge_fineweb.py --variant byte260
+```
+
+### Step 1: Create `train_jepa.py` (fork of `train_gpt.py`)
+
+**Changes from baseline:**
+1. **Remove SentencePiece dependency** — no tokenizer loading, no `build_sentencepiece_luts`
+2. **Set `vocab_size=260`** (256 bytes + 4 control tokens)
+3. **Simplify BPB eval**: each token = 1 byte (minus control tokens), so `tokens_per_byte ≈ 1.0`. Just convert CE loss from nats to bits: `bpb = loss / ln(2)`
+4. **Point data at `byte260` shards**: `DATA_PATH=./data/datasets/fineweb10B_byte260`
+
+### Step 2: Add byte patching (MegaByte-style)
+
+Byte sequences are ~3.5x longer than tokenized. Patching is essential for training speed.
+
+```
+Raw bytes: [b0, b1, b2, b3, b4, b5, b6, b7, ...]  (length 2048)
+                    ↓ group into patches of P=4
+Patches:   [[b0,b1,b2,b3], [b4,b5,b6,b7], ...]     (512 patches)
+                    ↓ local embed: Linear(P*d_byte, d_model) per patch
+Patch embs: [e0, e1, e2, ..., e511]                  (length 512)
+                    ↓ global transformer (causal attention)
+Hidden:     [h0, h1, h2, ..., h511]                  (length 512)
+                    ↓ unpack: project to P × 260 logits
+Per-byte:   CE loss on each of the 2048 target bytes
+```
+
+**Implementation:** ~50 lines — one `BytePatchEmbed` module and one `ByteUnpatch` module.
+
+### Step 3: JEPA auxiliary objective
+
+**Components to add (~100-150 lines):**
+
+```python
+class JEPAPredictor(nn.Module):
+    """2-layer transformer: predicts target patch embeddings from context."""
+    # Input: last K context patch embeddings
+    # Output: predicted embeddings for next M target patches
+    # Loss: cosine similarity with EMA encoder targets
+
+class EMAEncoder:
+    """Exponential moving average of main encoder weights."""
+    # Updated each step: θ_ema = τ * θ_ema + (1-τ) * θ_encoder
+    # τ schedule: 0.996 → 0.999 (cosine over training)
+
+def vicreg_loss(embeddings: Tensor) -> Tensor:
+    """Variance + covariance regularization."""
+    # L_var: hinge loss on per-dim std (keep std > 1)
+    # L_cov: off-diagonal covariance → 0
+    # ~15 lines
+```
+
+**Training loss:**
+```
+L = L_CE + λ_jepa * L_JEPA + λ_vic * L_VICReg
+
+Schedule:
+  Steps 0-500:     λ_jepa=0.0 (warmup CE only)
+  Steps 500-16000: λ_jepa=0.5
+  Steps 16000+:    λ_jepa→0.0 (cosine decay, CE-only fine-tune)
+  λ_vic=0.01 throughout
+```
+
+### Step 4: Model sizing
+
+```
+Target: 16MB artifact with int8+zlib (or int4 for more headroom)
+
+Byte embedding: 260 × 512 = 133K params (negligible!)
+Patch embed:    4×512 → 512 = ~1M params
+Global transformer: 12 layers × d=512, 8 heads, 4 KV heads, 2x MLP
+  Per layer: ~2.1M params
+  Total: ~25M params
+Unpatch head:   512 → 4×260 = ~0.5M params
+
+Kept at eval: ~27M params → int8+zlib ≈ ~12MB ✓
+              (or int4+zlib ≈ ~6MB, freeing budget for wider model)
+
+Discarded at eval:
+  JEPA predictor: ~4M params (2 transformer layers)
+  EMA encoder: copy of main encoder (not saved)
+  VICReg: no extra params
+```
+
+### Step 5: Training schedule (10 min, 8xH100)
+
+```
+Sequence: 2048 bytes → 512 patches (after P=4 patching)
+Batch: 524K bytes/step = 256 sequences × 2048 bytes
+FP8 + Flash Attention enabled
+
+Phase 1 (0-500 steps, ~20s): CE warmup only
+Phase 2 (500-16000 steps, ~7min): CE + JEPA + VICReg
+Phase 3 (16000-20000 steps, ~2.5min): CE only (JEPA weight → 0)
+
+Export:
+  - Strip JEPA predictor + EMA encoder
+  - Quantize to int8 (or int4 if quality holds)
+  - zlib compress
+  - Validate roundtrip BPB
+```
+
+### Step 6: Eval BPB for byte-level model
+
+The existing `eval_val` uses SentencePiece LUTs to count bytes-per-token. For byte260:
+- Each non-control token represents exactly 1 byte
+- Control tokens (bos=1, eos=2) represent 0 bytes
+- So: `tokens_per_byte ≈ 1.0` (slightly >1 due to bos/eos overhead)
+- Simplest: just count non-control target tokens as 1 byte each
+
+**Can reuse existing eval_val** with a custom LUT where `base_bytes_lut[4:260] = 1` and `base_bytes_lut[0:4] = 0`.
+
+### File changes summary
+
+| File | Action | ~Lines |
+|------|--------|--------|
+| `train_jepa.py` | NEW (fork of train_gpt.py) | ~800-900 |
+| `train_gpt.py` | UNCHANGED | — |
+| `data/cached_challenge_fineweb.py` | UNCHANGED (byte260 already supported) | — |
+| `JEPA.md` | This plan | — |
+
+### Success criteria
+
+1. **Minimum viable:** Byte-level model (no JEPA) achieves BPB < 1.40
+2. **JEPA helps:** Adding JEPA objective improves BPB by ≥ 0.02 over byte-only baseline
+3. **Beat baseline:** Final BPB < 1.2244 (post-quantization)
+
+### Risk mitigation
+
+- If byte patching is too lossy → try P=2 (2x sequence reduction instead of 4x)
+- If JEPA collapses → fall back to pure byte-level CE model (still a valid entry)
+- If 10-min budget too tight → reduce model size, increase batch, use FP8 aggressively
+- If byte260 data not available on the evaluation server → generate it with `cached_challenge_fineweb.py --variant byte260`
